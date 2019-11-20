@@ -471,7 +471,6 @@ module.exports = async (args: BootstrapArgs) => {
     {
       graphql: graphqlRunner,
       traceId: `initial-createPages`,
-      waitForCascadingActions: true,
       parentSpan: activity.span,
     },
     { activity }
@@ -491,7 +490,6 @@ module.exports = async (args: BootstrapArgs) => {
     {
       graphql: graphqlRunner,
       traceId: `initial-createPagesStatefully`,
-      waitForCascadingActions: true,
       parentSpan: activity.span,
     },
     {

@@ -1,4 +1,3 @@
-const BlueBirdPromise = require(`bluebird`)
 const _ = require(`lodash`)
 const chalk = require(`chalk`)
 const { bindActionCreators } = require(`redux`)
@@ -224,100 +223,95 @@ const runAPI = async (plugin, api, args, activity) => {
   return null
 }
 
-let apisRunningById = new Map()
-let apisRunningByTraceId = new Map()
-let waitingForCasacadeToFinish = []
+let concurrentCalls = 0
 
-module.exports = async (api, args = {}, { pluginSource, activity } = {}) =>
-  new Promise(resolve => {
-    const { parentSpan } = args
-    const apiSpanArgs = parentSpan ? { childOf: parentSpan } : {}
-    const apiSpan = tracer.startSpan(`run-api`, apiSpanArgs)
+module.exports = async (api, args = {}, { pluginSource, activity } = {}) => {
+  const { parentSpan } = args
+  const apiSpanArgs = parentSpan ? { childOf: parentSpan } : {}
+  const apiSpan = tracer.startSpan(`run-api`, apiSpanArgs)
 
-    apiSpan.setTag(`api`, api)
-    _.forEach(args.traceTags, (value, key) => {
-      apiSpan.setTag(key, value)
-    })
-
-    const plugins = store.getState().flattenedPlugins
-
-    // Get the list of plugins that implement this API.
-    // Also: Break infinite loops. Sometimes a plugin will implement an API and
-    // call an action which will trigger the same API being called.
-    // `onCreatePage` is the only example right now. In these cases, we should
-    // avoid calling the originating plugin again.
-    const implementingPlugins = plugins.filter(
-      plugin => plugin.nodeAPIs.includes(api) && plugin.name !== pluginSource
-    )
-
-    const apiRunInstance = {
-      api,
-      args,
-      pluginSource,
-      resolve,
-      span: apiSpan,
-      startTime: new Date().toJSON(),
-      traceId: args.traceId,
-    }
-
-    apiRunInstance.id = getApiId(api, apiRunInstance, args)
-
-    if (args.waitForCascadingActions) {
-      waitingForCasacadeToFinish.push(apiRunInstance)
-    }
-
-    if (apisRunningById.size === 0) {
-      emitter.emit(`API_RUNNING_START`)
-    }
-
-    apisRunningById.set(apiRunInstance.id, apiRunInstance)
-    if (apisRunningByTraceId.has(apiRunInstance.traceId)) {
-      const currentCount = apisRunningByTraceId.get(apiRunInstance.traceId)
-      apisRunningByTraceId.set(apiRunInstance.traceId, currentCount + 1)
-    } else {
-      apisRunningByTraceId.set(apiRunInstance.traceId, 1)
-    }
-
-    let stopQueuedApiRuns = false
-    let onAPIRunComplete = null
-    if (api === `onCreatePage`) {
-      const path = args.page.path
-      const actionHandler = action => {
-        if (action.payload.path === path) {
-          stopQueuedApiRuns = true
-        }
-      }
-      emitter.on(`DELETE_PAGE`, actionHandler)
-      onAPIRunComplete = () => {
-        emitter.off(`DELETE_PAGE`, actionHandler)
-      }
-    }
-
-    BlueBirdPromise.mapSeries(implementingPlugins, plugin =>
-      runPlugin(api, plugin, args, stopQueuedApiRuns, activity, apiSpan)
-    ).then(results =>
-      afterPlugin(
-        apiRunInstance,
-        args,
-        onAPIRunComplete,
-        apiSpan,
-        results,
-        resolve
-      )
-    )
+  apiSpan.setTag(`api`, api)
+  _.forEach(args.traceTags, (value, key) => {
+    apiSpan.setTag(key, value)
   })
 
-function runPlugin(api, plugin, args, stopQueuedApiRuns, activity, apiSpan) {
-  if (stopQueuedApiRuns) {
-    return null
+  const plugins = store.getState().flattenedPlugins
+
+  // Get the list of plugins that implement this API.
+  // Also: Break infinite loops. Sometimes a plugin will implement an API and
+  // call an action which will trigger the same API being called.
+  // `onCreatePage` is the only example right now. In these cases, we should
+  // avoid calling the originating plugin again.
+  const implementingPlugins = plugins.filter(
+    plugin => plugin.nodeAPIs.includes(api) && plugin.name !== pluginSource
+  )
+
+  // This is an async call. This func could have many concurrent calls
+  if (concurrentCalls === 0) {
+    emitter.emit(`API_RUNNING_START`)
+  }
+  ++concurrentCalls
+
+  let stopQueuedApiRuns = false
+  let onAPIRunComplete = null
+  if (api === `onCreatePage`) {
+    const path = args.page.path
+    const actionHandler = action => {
+      if (action.payload.path === path) {
+        stopQueuedApiRuns = true
+      }
+    }
+    emitter.on(`DELETE_PAGE`, actionHandler)
+    onAPIRunComplete = () => {
+      emitter.off(`DELETE_PAGE`, actionHandler)
+    }
   }
 
-  let pluginName =
-    plugin.name === `default-site-plugin` ? `gatsby-node.js` : plugin.name
+  let results = []
+  for (const plugin of implementingPlugins) {
+    if (stopQueuedApiRuns) {
+      break
+    }
+    let result = await runPlugin(
+      api,
+      plugin,
+      args,
+      stopQueuedApiRuns,
+      activity,
+      apiSpan
+    )
+    results.push(result)
+  }
 
-  return new Promise(resolve => {
-    resolve(runAPI(plugin, api, { ...args, parentSpan: apiSpan }, activity))
-  }).catch(err => {
+  if (onAPIRunComplete) {
+    onAPIRunComplete()
+  }
+
+  --concurrentCalls
+  if (concurrentCalls === 0) {
+    emitter.emit(`API_RUNNING_QUEUE_EMPTY`)
+  }
+
+  apiSpan.finish()
+
+  // Filter empty results
+  return results.filter(result => !_.isEmpty(result))
+}
+
+async function runPlugin(
+  api,
+  plugin,
+  args,
+  stopQueuedApiRuns,
+  activity,
+  apiSpan
+) {
+  try {
+    return await runAPI(plugin, api, { ...args, parentSpan: apiSpan }, activity)
+  } catch (err) {
+    let pluginName =
+      plugin.name === `default-site-plugin` ? `gatsby-node.js` : plugin.name
+
     decorateEvent(`BUILD_PANIC`, {
       pluginName: `${plugin.name}@${plugin.version}`,
     })
@@ -335,73 +329,5 @@ function runPlugin(api, plugin, args, stopQueuedApiRuns, activity, apiSpan) {
     })
 
     return null
-  })
-}
-
-function afterPlugin(
-  apiRunInstance,
-  args,
-  onAPIRunComplete,
-  apiSpan,
-  results,
-  resolve
-) {
-  if (onAPIRunComplete) {
-    onAPIRunComplete()
   }
-  // Remove runner instance
-  apisRunningById.delete(apiRunInstance.id)
-  const currentCount = apisRunningByTraceId.get(apiRunInstance.traceId)
-  apisRunningByTraceId.set(apiRunInstance.traceId, currentCount - 1)
-
-  if (apisRunningById.size === 0) {
-    emitter.emit(`API_RUNNING_QUEUE_EMPTY`)
-  }
-
-  // Filter empty results
-  apiRunInstance.results = results.filter(result => !_.isEmpty(result))
-
-  // Filter out empty responses and return if the
-  // api caller isn't waiting for cascading actions to finish.
-  if (!args.waitForCascadingActions) {
-    apiSpan.finish()
-    resolve(apiRunInstance.results)
-  }
-
-  // Check if any of our waiters are done.
-  waitingForCasacadeToFinish = waitingForCasacadeToFinish.filter(instance => {
-    // If none of its trace IDs are running, it's done.
-    const apisByTraceIdCount = apisRunningByTraceId.get(instance.traceId)
-    if (apisByTraceIdCount === 0) {
-      instance.span.finish()
-      instance.resolve(instance.results)
-      return false
-    } else {
-      return true
-    }
-  })
-}
-
-function getApiId(api, apiRunInstance, args) {
-  // Generate IDs for api runs. Most IDs we generate from the args
-  // but some API calls can have very large argument objects so we
-  // have special ways of generating IDs for those to avoid stringifying
-  // large objects.
-  if (api === `setFieldsOnGraphQLNodeType`) {
-    return `${api}${apiRunInstance.startTime}${args.type.name}${args.traceId}`
-  }
-  if (api === `onCreateNode`) {
-    return `${api}${apiRunInstance.startTime}${args.node.internal.contentDigest}${args.traceId}`
-  }
-  if (api === `preprocessSource`) {
-    return `${api}${apiRunInstance.startTime}${args.filename}${args.traceId}`
-  }
-  if (api === `onCreatePage`) {
-    return `${api}${apiRunInstance.startTime}${args.page.path}${args.traceId}`
-  }
-  // When tracing is turned on, the `args` object will have a
-  // `parentSpan` field that can be quite large. So we omit it
-  // before calling stringify
-  const argsJson = JSON.stringify(_.omit(args, `parentSpan`))
-  return `${api}|${apiRunInstance.startTime}|${apiRunInstance.traceId}|${argsJson}`
 }

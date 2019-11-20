@@ -42,7 +42,6 @@ const runCreatePages = async () => {
     {
       graphql,
       traceId: `createPages`,
-      waitForCascadingActions: true,
     },
     { activity }
   )
