@@ -1,89 +1,86 @@
 // @flow
-import path from "path"
-const normalize = require(`normalize-path`)
-import glob from "glob"
-const levenshtein = require(`fast-levenshtein`)
-
-import {
-  IRTransforms,
-  Parser as RelayParser,
-  ASTConvert,
-  filterContextForNode,
-  CompilerContext as GraphQLCompilerContext,
-  IRPrinter as GraphQLIRPrinter,
-  Schema,
-} from "relay-compiler"
-import getGatsbyDependents from "../utils/gatsby-dependents"
 const _ = require(`lodash`)
 
-import { store } from "../redux"
-const { boundActionCreators } = require(`../redux/actions`)
-import FileParser from "./file-parser"
-import { graphqlError, multipleRootQueriesError } from "./graphql-errors"
-import report from "gatsby-cli/lib/reporter"
-import errorParser, { locInGraphQlToLocInFile } from "./error-parser"
-const websocketManager = require(`../utils/websocket-manager`)
-
-import type { DocumentNode, GraphQLSchema } from "graphql"
-
-const ClientExtensionsTransform = require(`relay-compiler/lib/transforms/ClientExtensionsTransform`)
-const FilterDirectivesTransform = require(`relay-compiler/lib/transforms/FilterDirectivesTransform`)
-const FlattenTransform = require(`relay-compiler/lib/transforms/FlattenTransform`)
-const GenerateTypeNameTransform = require(`relay-compiler/lib/transforms/GenerateTypeNameTransform`)
-const SkipClientExtensionsTransform = require(`relay-compiler/lib/transforms/SkipClientExtensionsTransform`)
-const SkipHandleFieldTransform = require(`relay-compiler/lib/transforms/SkipHandleFieldTransform`)
-const SkipUnreachableNodeTransform = require(`relay-compiler/lib/transforms/SkipUnreachableNodeTransform`)
-const ValidateRequiredArgumentsTransform = require(`relay-compiler/lib/transforms/ValidateRequiredArgumentsTransform`)
-
-const printTransforms = [
-  ClientExtensionsTransform.transform,
-  SkipClientExtensionsTransform.transform,
-  SkipUnreachableNodeTransform.transform,
-  FlattenTransform.transformWithOptions({}),
-  GenerateTypeNameTransform.transform,
-  SkipHandleFieldTransform.transform,
-  FilterDirectivesTransform.transform,
-  // Breaks on nested variables
-  // SkipUnusedVariablesTransform.transform,
-  ValidateRequiredArgumentsTransform.transform,
-]
+const path = require(`path`)
+const normalize = require(`normalize-path`)
+const glob = require(`glob`)
+const levenshtein = require(`fast-levenshtein`)
 
 const {
-  ValuesOfCorrectTypeRule,
+  validate,
+  print,
+  visit,
+  Kind,
+  FieldsOnCorrectTypeRule,
   FragmentsOnCompositeTypesRule,
+  KnownArgumentNamesRule,
+  KnownDirectivesRule,
   KnownTypeNamesRule,
   LoneAnonymousOperationRule,
+  NoFragmentCyclesRule,
+  NoUndefinedVariablesRule,
+  NoUnusedVariablesRule,
+  OverlappingFieldsCanBeMergedRule,
   PossibleFragmentSpreadsRule,
+  ProvidedRequiredArgumentsRule,
   ScalarLeafsRule,
+  SingleFieldSubscriptionsRule,
+  UniqueArgumentNamesRule,
+  UniqueDirectivesPerLocationRule,
+  UniqueFragmentNamesRule,
+  UniqueInputFieldNamesRule,
+  UniqueOperationNamesRule,
+  UniqueVariableNamesRule,
+  ValuesOfCorrectTypeRule,
   VariablesAreInputTypesRule,
   VariablesInAllowedPositionRule,
-  Kind,
-  validate,
-  printSchema,
-  print,
-  Source,
 } = require(`graphql`)
 
-type RootQuery = {
-  name: string,
-  path: string,
-  text: string,
-  originalText: string,
-  isStaticQuery: boolean,
-  hash: string,
-}
+// TODO: Make it a default export in graphql
+const {
+  ExecutableDefinitions: ExecutableDefinitionsRule,
+} = require(`graphql/validation/rules/ExecutableDefinitions`)
 
-type Queries = Map<string, RootQuery>
+const getGatsbyDependents = require(`../utils/gatsby-dependents`)
+const { store } = require(`../redux`)
+const { actions } = require(`../redux/actions/internal`)
+const { default: FileParser } = require(`./file-parser`)
+const { graphqlError, multipleRootQueriesError } = require(`./graphql-errors`)
+const report = require(`gatsby-cli/lib/reporter`)
+const {
+  default: errorParser,
+  locInGraphQlToLocInFile,
+} = require(`./error-parser`)
+const websocketManager = require(`../utils/websocket-manager`)
 
-const validationRules = [
-  ValuesOfCorrectTypeRule,
-  FragmentsOnCompositeTypesRule,
-  KnownTypeNamesRule,
+const preValidationRules = [
   LoneAnonymousOperationRule,
-  PossibleFragmentSpreadsRule,
-  ScalarLeafsRule,
+  KnownTypeNamesRule,
+  FragmentsOnCompositeTypesRule,
   VariablesAreInputTypesRule,
+  ScalarLeafsRule,
+  PossibleFragmentSpreadsRule,
+  ValuesOfCorrectTypeRule,
   VariablesInAllowedPositionRule,
+]
+
+const mainValidationRules = [
+  ExecutableDefinitionsRule,
+  UniqueOperationNamesRule,
+  SingleFieldSubscriptionsRule,
+  FieldsOnCorrectTypeRule,
+  UniqueFragmentNamesRule,
+  NoFragmentCyclesRule,
+  UniqueVariableNamesRule,
+  NoUndefinedVariablesRule,
+  NoUnusedVariablesRule,
+  KnownDirectivesRule,
+  UniqueDirectivesPerLocationRule,
+  KnownArgumentNamesRule,
+  UniqueArgumentNamesRule,
+  ProvidedRequiredArgumentsRule,
+  OverlappingFieldsCanBeMergedRule,
+  UniqueInputFieldNamesRule,
 ]
 
 const overlayErrorID = `graphql-compiler`
@@ -109,8 +106,8 @@ class Runner {
   ) {
     this.base = base
     this.additional = additional
-    this.graphQLSchema = schema
-    this.relaySchema = Schema.create(new Source(printSchema(schema)))
+    this.schema = schema
+    // this.relaySchema = Schema.create(new Source(printSchema(schema)))
     this.parentSpan = parentSpan
   }
 
@@ -175,11 +172,11 @@ class Runner {
     const namePathMap = new Map()
     const nameDefMap = new Map()
     const nameErrorMap = new Map()
-    const documents = []
+    const operationDefinitions = []
     const fragmentMap = new Map()
 
     for (const [filePath, doc] of nodes.entries()) {
-      const errors = validate(this.graphQLSchema, doc, validationRules)
+      const errors = validate(this.schema, doc, preValidationRules)
 
       if (errors && errors.length) {
         addError(
@@ -194,7 +191,7 @@ class Runner {
           })
         )
 
-        boundActionCreators.queryExtractionGraphQLError({
+        actions.queryExtractionGraphQLError({
           componentPath: filePath,
         })
         return compiledNodes
@@ -209,66 +206,60 @@ class Runner {
         if (definition.kind === Kind.FRAGMENT_DEFINITION) {
           const fragmentName = definition.name.value
           if (fragmentMap.has(fragmentName)) {
-            if (print(definition) === fragmentMap.get(fragmentName)) {
+            if (print(definition) === fragmentMap.get(fragmentName).text) {
               return false
             }
           } else {
-            fragmentMap.set(fragmentName, print(definition))
+            fragmentMap.set(fragmentName, {
+              def: definition,
+              text: print(definition),
+            })
           }
         }
         return true
       })
 
-      documents.push(doc)
       doc.definitions.forEach((def: any) => {
         const name: string = def.name.value
         namePathMap.set(name, filePath)
         nameDefMap.set(name, def)
+        if (def.kind === Kind.OPERATION_DEFINITION) {
+          operationDefinitions.push(def)
+        }
       })
     }
 
-    let compilerContext = new GraphQLCompilerContext(this.relaySchema)
-    try {
-      compilerContext = compilerContext.addAll(
-        ASTConvert.convertASTDocuments(
-          this.relaySchema,
-          documents,
-          RelayParser.transform.bind(RelayParser)
+    const globalDoc = {
+      kind: Kind.DOCUMENT,
+      definitions: [
+        ...operationDefinitions,
+        ...Array.from(fragmentMap.values()).map(({ def }) => def),
+      ],
+    }
+    const errors = validate(this.schema, globalDoc, mainValidationRules)
+    if (errors && errors.length) {
+      for (const error of errors) {
+        const { formattedMessage, docName, message, codeBlock } = graphqlError(
+          namePathMap,
+          nameDefMap,
+          error
         )
-      )
-    } catch (error) {
-      const { formattedMessage, docName, message, codeBlock } = graphqlError(
-        namePathMap,
-        nameDefMap,
-        error
-      )
-      nameErrorMap.set(docName, { formattedMessage, message, codeBlock })
-      boundActionCreators.queryExtractionGraphQLError({
-        componentPath: namePathMap.get(docName),
-        error: formattedMessage,
-      })
+        nameErrorMap.set(docName, { formattedMessage, message, codeBlock })
+        actions.queryExtractionGraphQLError({
+          componentPath: namePathMap.get(docName),
+          error: formattedMessage,
+        })
 
-      const filePath = namePathMap.get(docName)
-      addError(errorParser({ message, filePath }))
-
-      return false
+        const filePath = namePathMap.get(docName)
+        addError(errorParser({ message, filePath }))
+      }
     }
 
-    const printContext = printTransforms.reduce(
-      (ctx, transform) => transform(ctx),
-      compilerContext
-    )
+    const usedFragmentsForFragment = new Map()
+    const fragmentNames = Array.from(fragmentMap.keys())
 
-    const fragments = []
-    compilerContext.documents().forEach(node => {
-      if (node.kind === `Fragment`) {
-        fragments.push(node.name)
-      }
-    })
-
-    compilerContext.documents().forEach((node: { name: string }) => {
-      if (node.kind !== `Root`) return
-      const { name } = node
+    for (const operation of operationDefinitions) {
+      const name = operation.name.value
       const filePath = namePathMap.get(name) || ``
       if (compiledNodes.has(filePath)) {
         const otherNode = compiledNodes.get(filePath)
@@ -281,47 +272,65 @@ class Runner {
           )
         )
 
-        boundActionCreators.queryExtractionGraphQLError({
+        actions.queryExtractionGraphQLError({
           componentPath: filePath,
         })
-        return
+        continue
       }
-      let text
-      try {
-        text = filterContextForNode(printContext.getRoot(name), printContext)
-          .documents()
-          .map(GraphQLIRPrinter.print)
-          .join(`\n`)
-      } catch (error) {
-        const regex = /Unknown\sdocument\s`(.*)`/gm
-        const str = error.toString()
-        let m
 
-        let fragmentName
-        while ((m = regex.exec(str)) !== null) {
-          // This is necessary to avoid infinite loops with zero-width matches
-          if (m.index === regex.lastIndex) regex.lastIndex++
+      const usedFragments = new Set()
+      const stack = [operation]
+      const missingFragment = false
 
-          fragmentName = m[1]
-        }
+      while (stack.length > 0) {
+        const def = stack.pop(operation)
+        visit(def, {
+          [Kind.FRAGMENT_SPREAD]: node => {
+            const name = node.name.value
+            if (usedFragmentsForFragment.has(name)) {
+              usedFragmentsForFragment
+                .get(name)
+                .forEach(derivedFragmentName => {
+                  usedFragments.add(derivedFragmentName)
+                })
+              usedFragments.add(name)
+            } else if (fragmentMap.has(name)) {
+              stack.push(fragmentMap.get(name).def)
+              usedFragments.add(name)
+            } else {
+              const closestFragment = fragmentNames
+                .map(f => {
+                  return { fragment: f, score: levenshtein.get(name, f) }
+                })
+                .filter(f => f.score < 10)
+                .sort((a, b) => a.score > b.score)[0]?.fragment
 
-        const closestFragment = fragments
-          .map(f => {
-            return { fragment: f, score: levenshtein.get(fragmentName, f) }
-          })
-          .filter(f => f.score < 10)
-          .sort((a, b) => a.score > b.score)[0]?.fragment
-
-        addError({
-          id: `85908`,
-          filePath,
-          context: { fragmentName, closestFragment },
+              actions.queryExtractionGraphQLError({
+                componentPath: filePath,
+              })
+              addError({
+                id: `85908`,
+                filePath,
+                context: { fragmentName: name, closestFragment },
+              })
+            }
+          },
         })
+      }
+      if (missingFragment) {
+        continue
+      }
+
+      const document = {
+        kind: Kind.DOCUMENT,
+        definitions: Array.from(usedFragments.values())
+          .map(name => fragmentMap.get(name).def)
+          .concat([operation]),
       }
 
       const query = {
         name,
-        text,
+        text: print(document),
         originalText: nameDefMap.get(name).text,
         path: filePath,
         isHook: nameDefMap.get(name).isHook,
@@ -349,11 +358,12 @@ class Runner {
       }
 
       compiledNodes.set(filePath, query)
-    })
+    }
 
     return compiledNodes
   }
 }
+
 export { Runner, resolveThemes }
 
 export default async function compile({ parentSpan } = {}): Promise<

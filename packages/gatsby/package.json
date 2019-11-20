@@ -116,7 +116,6 @@
     "react-hot-loader": "^4.12.16",
     "redux": "^4.0.4",
     "redux-thunk": "^2.3.0",
-    "relay-compiler": "^7.1.0",
     "semver": "^5.7.1",
     "shallow-compare": "^1.2.2",
     "sift": "^5.1.0",
