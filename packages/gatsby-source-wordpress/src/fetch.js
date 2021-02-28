@@ -290,6 +290,12 @@ async function fetchData({
         return { ...r, ID: r.term_id }
       })
     }
+	// mine
+  if (type.includes(`wordpress__redirection_redirect`)) {
+   routeResponse.map(function(key, index) {
+      routeResponse = key.items;
+   });
+  }
     // Process entities to creating GraphQL Nodes.
     if (Array.isArray(routeResponse)) {
       routeResponse = routeResponse.map(r => {
@@ -398,7 +404,15 @@ async function getPages(
           page: page,
         })}`,
       }
-
+      if (strpos(url, 'redirection/v1/redirect') > 0) {
+         o = {
+            method: `get`,
+            url: `${url}?${querystring.stringify({
+              per_page: _perPage,
+              page: page*1 -1
+            })}`
+          };
+      }
       if (_accessToken) {
         o.headers = {
           Authorization: `Bearer ${_accessToken}`,
